@@ -53,6 +53,7 @@ jobs:
             --add-binary "AdbWinApi.dll;." `
             --add-binary "AdbWinUsbApi.dll;." `
             --add-data "scrcpy-server;." `
+            --add-data "assets;assets" `
             --name "ScrcpyWiFiManager" `
             main.py
 
@@ -89,6 +90,7 @@ jobs:
       - name: Build with PyInstaller (Linux Binary)
         run: |
           pyinstaller --noconsole --onefile \
+            --add-data "assets:assets" \
             --name "ScrcpyWiFiManager-Linux" \
             main.py
           chmod +x dist/ScrcpyWiFiManager-Linux

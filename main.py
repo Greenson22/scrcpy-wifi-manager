@@ -9,11 +9,11 @@ import platform
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, 
     QLabel, QLineEdit, QPushButton, QCheckBox, 
-    QComboBox, QTextEdit, QMessageBox,
-    QScrollArea, QFrame, QGraphicsDropShadowEffect
+    QComboBox, QTextEdit, QMessageBox, QDialog,
+    QScrollArea, QFrame, QGraphicsDropShadowEffect, QTabWidget
 )
-from PyQt6.QtCore import QProcess, Qt
-from PyQt6.QtGui import QColor, QFont, QCursor
+from PyQt6.QtCore import QProcess, Qt, QProcessEnvironment, QUrl
+from PyQt6.QtGui import QColor, QFont, QCursor, QPixmap, QPainter, QPainterPath, QDesktopServices
 
 CONFIG_FILE = "config.json"
 IS_WINDOWS = platform.system() == "Windows"
@@ -57,13 +57,42 @@ def setup_environment():
     if os.path.isfile(server_path):
         os.environ["SCRCPY_SERVER_PATH"] = server_path
 
+def get_clean_env():
+    """
+    Membersihkan LD_LIBRARY_PATH khusus Linux / PyInstaller agar subprocess
+    (seperti adb dan scrcpy) menggunakan library C++ sistem operasi OS asli,
+    bukan bundle bawaan PyInstaller. Aman dan cross-platform untuk Windows juga.
+    """
+    env = os.environ.copy()
+    if not IS_WINDOWS:
+        if "LD_LIBRARY_PATH_ORIG" in env:
+            env["LD_LIBRARY_PATH"] = env.pop("LD_LIBRARY_PATH_ORIG")
+        else:
+            env.pop("LD_LIBRARY_PATH", None)
+    return env
+
 def get_subprocess_kwargs():
-    """Mencegah jendela CMD/konsol hitam berkedip di Windows saat eksekusi subprocess."""
-    kwargs = {}
+    """Mencegah jendela CMD/konsol hitam berkedip di Windows serta membersihkan environment library di Linux."""
+    kwargs = {"env": get_clean_env()}
     if IS_WINDOWS:
         # Gunakan flag CREATE_NO_WINDOW (0x08000000)
         kwargs["creationflags"] = 0x08000000
     return kwargs
+
+def send_adb_keyevent(target, keycode, display_id=None):
+    """Mengirim event tombol ADB (4=Back, 3=Home, 187=App Switch/Pilih) secara non-blocking"""
+    adb_bin = get_binary_path("adb")
+    cmd = [adb_bin]
+    if target:
+        cmd.extend(["-s", target])
+    cmd.extend(["shell", "input"])
+    if display_id is not None:
+        cmd.extend(["-d", str(display_id)])
+    cmd.extend(["keyevent", str(keycode)])
+    try:
+        subprocess.Popen(cmd, **get_subprocess_kwargs())
+    except Exception as e:
+        print(f"Error sending keyevent: {e}")
 
 DEFAULT_CONFIG = {
     "ip": "",
@@ -72,11 +101,13 @@ DEFAULT_CONFIG = {
     "mode": "mirror",  # "mirror" atau "virtual"
     "mirror_turn_screen_off": False,
     "mirror_stay_awake": True,
+    "mirror_nav_buttons": True,
     "virtual_displays": [
         {
             "name": "Display 1 (Vertical)",
             "res": "1080x1920/320",
-            "enabled": True
+            "enabled": True,
+            "nav_buttons": True
         }
     ],
     "no_audio": True,
@@ -347,6 +378,42 @@ QTextEdit#logOutput {
     font-family: 'JetBrains Mono', 'Consolas', 'Courier New', monospace;
     font-size: 11.5px;
 }
+
+/* Tombol Info / About */
+QPushButton#btnAbout {
+    background-color: #EEF2FF;
+    color: #4F46E5;
+    border: 1px solid #C7D2FE;
+    border-radius: 12px;
+    padding: 6px 12px;
+    font-weight: 600;
+}
+QPushButton#btnAbout:hover {
+    background-color: #E0E7FF;
+}
+
+/* Styling Tabs di Dialog About */
+QTabWidget::pane {
+    border: 1px solid #E2E8F0;
+    border-radius: 12px;
+    background-color: #FFFFFF;
+    top: -1px;
+}
+QTabBar::tab {
+    background: #F1F5F9;
+    color: #64748B;
+    border: 1px solid #E2E8F0;
+    padding: 8px 18px;
+    border-top-left-radius: 10px;
+    border-top-right-radius: 10px;
+    margin-right: 4px;
+    font-weight: 600;
+}
+QTabBar::tab:selected {
+    background: #FFFFFF;
+    color: #4F46E5;
+    border-bottom: 2px solid #4F46E5;
+}
 """
 
 def add_clay_shadow(widget, blur=18, offset_y=4, alpha=22):
@@ -355,6 +422,323 @@ def add_clay_shadow(widget, blur=18, offset_y=4, alpha=22):
     shadow.setOffset(0, offset_y)
     shadow.setColor(QColor(15, 23, 42, alpha))
     widget.setGraphicsEffect(shadow)
+
+def get_circular_avatar(pixmap, size=110):
+    """Memotong foto menjadi bentuk lingkaran halus dengan antialiasing."""
+    scaled = pixmap.scaled(size, size, Qt.AspectRatioMode.KeepAspectRatioByExpanding, Qt.TransformationMode.SmoothTransformation)
+    target = QPixmap(size, size)
+    target.fill(Qt.GlobalColor.transparent)
+
+    painter = QPainter(target)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    path = QPainterPath()
+    path.addEllipse(0, 0, size, size)
+    painter.setClipPath(path)
+
+    # Pusatkan pemotongan
+    x = (scaled.width() - size) // 2
+    y = (scaled.height() - size) // 2
+    painter.drawPixmap(0, 0, scaled.copy(x, y, size, size))
+    painter.end()
+    return target
+
+
+class AboutDialog(QDialog):
+    """Dialog Tentang Aplikasi & Pengembang"""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Tentang Scrcpy WiFi & USB Manager")
+        self.setFixedSize(540, 580)
+        self.setStyleSheet(CLAY_STYLESHEET)
+        self.initUI()
+
+    def initUI(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(18, 18, 18, 18)
+        layout.setSpacing(14)
+
+        tabs = QTabWidget()
+
+        # ====== TAB 1: FITUR APLIKASI ======
+        tab_features = QWidget()
+        feat_layout = QVBoxLayout(tab_features)
+        feat_layout.setContentsMargins(14, 14, 14, 14)
+        feat_layout.setSpacing(10)
+
+        feat_scroll = QScrollArea()
+        feat_scroll.setWidgetResizable(True)
+        feat_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+
+        feat_content = QWidget()
+        feat_content_layout = QVBoxLayout(feat_content)
+        feat_content_layout.setSpacing(12)
+        feat_content_layout.setContentsMargins(4, 4, 4, 4)
+
+        fitur_list = [
+            ("📶 & 🔌 Mode Ganda (Wi-Fi & USB Debugging)", "Fleksibel mengontrol Android secara nirkabel maupun lewat kabel USB. Jika IP & Port dikosongkan, aplikasi otomatis beralih ke mode USB."),
+            ("🖥️ Mirroring & Multi-Display Virtual", "Mendukung proyeksi layar primer fisik maupun pembuatan layar virtual kedua/ketiga dengan resolusi dan DPI kustom."),
+            ("⚡ Deteksi IP & Smart Paste", "Deteksi cepat subnet lokal komputer serta pemisahan otomatis format IP:Port dari papan klip (clipboard)."),
+            ("🎛️ Kontrol Bitrate & Audio", "Atur video bit-rate sesuai kestabilan jaringan Wi-Fi Anda serta opsi mematikan streaming audio."),
+            ("🔋 Manajemen Daya Layar", "Fitur mematikan layar HP fisik saat mirroring berjalan (--turn-screen-off) dan menjaga HP tetap terjaga (--stay-awake)."),
+            ("🌐 Cross-Platform Linux & Windows", "Bisa berjalan mulus di Linux dan Windows tanpa kendala library C++ maupun cmd window berkedip.")
+        ]
+
+        for title, desc in fitur_list:
+            card = QFrame()
+            card.setProperty("class", "innerCard")
+            c_layout = QVBoxLayout(card)
+            c_layout.setContentsMargins(12, 10, 12, 10)
+            c_layout.setSpacing(4)
+
+            t_lbl = QLabel(title)
+            t_lbl.setStyleSheet("font-weight: 700; color: #1E293B; font-size: 13px;")
+            d_lbl = QLabel(desc)
+            d_lbl.setWordWrap(True)
+            d_lbl.setStyleSheet("color: #475569; font-size: 12px; line-height: 1.4;")
+
+            c_layout.addWidget(t_lbl)
+            c_layout.addWidget(d_lbl)
+            feat_content_layout.addWidget(card)
+
+        feat_content_layout.addStretch()
+        feat_scroll.setWidget(feat_content)
+        feat_layout.addWidget(feat_scroll)
+        tabs.addTab(tab_features, "Fitur Aplikasi")
+
+        # ====== TAB 2: PENGEMBANG ======
+        tab_dev = QWidget()
+        dev_layout = QVBoxLayout(tab_dev)
+        dev_layout.setContentsMargins(20, 20, 20, 20)
+        dev_layout.setSpacing(14)
+        dev_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        # Foto Profil
+        base_dir = get_base_dir()
+        pic_paths = [
+            os.path.join(base_dir, "assets", "profile.jpg"),
+            os.path.join(base_dir, "profile.jpg"),
+            "/home/lemon-manis-22/Projects/Python3/scrcpy-wifi-manager/assets/profile.jpg"
+        ]
+        pic_path = None
+        for p in pic_paths:
+            if os.path.isfile(p):
+                pic_path = p
+                break
+
+        avatar_lbl = QLabel()
+        avatar_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        if pic_path:
+            src_pix = QPixmap(pic_path)
+            circle_pix = get_circular_avatar(src_pix, size=115)
+            avatar_lbl.setPixmap(circle_pix)
+        else:
+            avatar_lbl.setText("👤")
+            avatar_lbl.setStyleSheet("font-size: 48px;")
+        dev_layout.addWidget(avatar_lbl)
+
+        # Nama Pengembang
+        name_lbl = QLabel("Frendy Rikal Gerung, S.Kom.")
+        name_lbl.setStyleSheet("font-size: 16px; font-weight: 800; color: #1E293B;")
+        name_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        dev_layout.addWidget(name_lbl)
+
+        # Almamater
+        title_lbl = QLabel("Sarjana Komputer - Universitas Negeri Manado")
+        title_lbl.setStyleSheet("font-size: 13px; font-weight: 600; color: #4F46E5;")
+        title_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        dev_layout.addWidget(title_lbl)
+
+        # Dedikasi / Kutipan
+        quote_frame = QFrame()
+        quote_frame.setProperty("class", "innerCard")
+        q_layout = QVBoxLayout(quote_frame)
+        q_layout.setContentsMargins(14, 12, 14, 12)
+        q_layout.setSpacing(6)
+
+        quote_txt = QLabel(
+            "\"Serahkanlah perbuatanmu kepada TUHAN,\nmaka terlaksanalah segala rencanamu.\"\n— Amsal 16:3 —"
+        )
+        quote_txt.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        quote_txt.setStyleSheet("font-style: italic; font-weight: 600; color: #334155; font-size: 12px;")
+        q_layout.addWidget(quote_txt)
+
+        dedication_txt = QLabel(
+            "Aplikasi ini dikembangkan untuk mempermudah alur kerja debugging, produktivitas, serta pemanfaatan perangkat Android sebagai layar tambahan secara fleksibel baik nirkabel maupun kabel."
+        )
+        dedication_txt.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        dedication_txt.setWordWrap(True)
+        dedication_txt.setStyleSheet("color: #64748B; font-size: 12px; margin-top: 4px;")
+        q_layout.addWidget(dedication_txt)
+
+        dev_layout.addWidget(quote_frame)
+
+        # Tombol Tautan (LinkedIn & Email)
+        btn_box = QHBoxLayout()
+        btn_box.setSpacing(12)
+        btn_box.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        btn_linkedin = QPushButton("🔗 LinkedIn")
+        btn_linkedin.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        btn_linkedin.clicked.connect(lambda: QDesktopServices.openUrl(QUrl("https://linkedin.com/in/frendy-rikal-gerung-bb450b38a/")))
+
+        btn_email = QPushButton("✉️ Email")
+        btn_email.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        btn_email.clicked.connect(lambda: QDesktopServices.openUrl(QUrl("mailto:frendydev1@gmail.com")))
+
+        btn_box.addWidget(btn_linkedin)
+        btn_box.addWidget(btn_email)
+        dev_layout.addLayout(btn_box)
+
+        dev_layout.addStretch()
+        tabs.addTab(tab_dev, "Pengembang")
+
+        layout.addWidget(tabs)
+
+        # Tombol Tutup
+        btn_close = QPushButton("Tutup")
+        btn_close.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        btn_close.clicked.connect(self.accept)
+        layout.addWidget(btn_close)
+
+
+class NavOverlayBar(QWidget):
+    """Bilah Navigasi Layar Melayang (Back, Home, App Switch/Pilih) yang Always-On-Top"""
+    def __init__(self, title, target_adb, display_id=None, on_close=None):
+        super().__init__()
+        self.title_text = title
+        self.target_adb = target_adb
+        self.display_id = display_id
+        self.on_close_callback = on_close
+        self.drag_position = None
+        
+        self.setWindowFlags(
+            Qt.WindowType.FramelessWindowHint | 
+            Qt.WindowType.WindowStaysOnTopHint | 
+            Qt.WindowType.Tool
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.initUI()
+
+    def initUI(self):
+        main_layout = QHBoxLayout(self)
+        main_layout.setContentsMargins(4, 4, 4, 4)
+
+        # Container Pill Card
+        self.container = QFrame()
+        self.container.setStyleSheet("""
+            QFrame {
+                background-color: rgba(15, 23, 42, 0.94);
+                border-radius: 20px;
+                border: 1px solid rgba(255, 255, 255, 0.18);
+            }
+        """)
+        add_clay_shadow(self.container, blur=18, offset_y=4, alpha=90)
+
+        c_layout = QHBoxLayout(self.container)
+        c_layout.setContentsMargins(10, 6, 10, 6)
+        c_layout.setSpacing(6)
+
+        # Drag handle & Title
+        self.lbl_title = QLabel(f"⋮⋮ {self.title_text}")
+        self.lbl_title.setStyleSheet("color: #94A3B8; font-weight: 700; font-size: 11px; padding: 2px 4px; background: transparent;")
+        self.lbl_title.setCursor(QCursor(Qt.CursorShape.SizeAllCursor))
+        self.lbl_title.setToolTip("Klik & geser untuk memindahkan bilah navigasi")
+        c_layout.addWidget(self.lbl_title)
+
+        btn_style = """
+            QPushButton {
+                background-color: rgba(255, 255, 255, 0.12);
+                color: #F8FAFC;
+                border: 1px solid rgba(255, 255, 255, 0.18);
+                border-radius: 12px;
+                font-size: 12px;
+                font-weight: 600;
+                padding: 6px 12px;
+            }
+            QPushButton:hover {
+                background-color: #6366F1;
+                border: 1px solid #818CF8;
+                color: #FFFFFF;
+            }
+            QPushButton:pressed {
+                background-color: #4F46E5;
+            }
+        """
+
+        # 1. Tombol Kembali (Back - Keycode 4)
+        self.btn_back = QPushButton("◀ Kembali")
+        self.btn_back.setStyleSheet(btn_style)
+        self.btn_back.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.btn_back.setToolTip("Kembali (Back - Keycode 4)")
+        self.btn_back.clicked.connect(lambda: self.send_key(4))
+        c_layout.addWidget(self.btn_back)
+
+        # 2. Tombol Home (Home - Keycode 3)
+        self.btn_home = QPushButton("⌂ Home")
+        self.btn_home.setStyleSheet(btn_style)
+        self.btn_home.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.btn_home.setToolTip("Beranda (Home - Keycode 3)")
+        self.btn_home.clicked.connect(lambda: self.send_key(3))
+        c_layout.addWidget(self.btn_home)
+
+        # 3. Tombol Pilih / Recents (App Switch - Keycode 187)
+        self.btn_recents = QPushButton("▢ Pilih")
+        self.btn_recents.setStyleSheet(btn_style)
+        self.btn_recents.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.btn_recents.setToolTip("Pilih / Recent Apps (App Switch - Keycode 187)")
+        self.btn_recents.clicked.connect(lambda: self.send_key(187))
+        c_layout.addWidget(self.btn_recents)
+
+        # Tombol Tutup Kecil (✕)
+        btn_close = QPushButton("✕")
+        btn_close.setStyleSheet("""
+            QPushButton {
+                background-color: transparent;
+                color: #94A3B8;
+                border: none;
+                font-size: 13px;
+                font-weight: bold;
+                padding: 4px 8px;
+                border-radius: 8px;
+            }
+            QPushButton:hover {
+                background-color: #EF4444;
+                color: #FFFFFF;
+            }
+        """)
+        btn_close.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        btn_close.setToolTip("Tutup Bilah Navigasi Layar Ini")
+        btn_close.clicked.connect(self.close)
+        c_layout.addWidget(btn_close)
+
+        main_layout.addWidget(self.container)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.drag_position = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
+            event.accept()
+
+    def mouseMoveEvent(self, event):
+        if event.buttons() == Qt.MouseButton.LeftButton and self.drag_position is not None:
+            self.move(event.globalPosition().toPoint() - self.drag_position)
+            event.accept()
+
+    def mouseReleaseEvent(self, event):
+        self.drag_position = None
+
+    def closeEvent(self, event):
+        if self.on_close_callback:
+            self.on_close_callback(self)
+        super().closeEvent(event)
+
+    def set_display_id(self, display_id):
+        self.display_id = display_id
+        if display_id is not None:
+            self.lbl_title.setText(f"⋮⋮ {self.title_text} [D:{display_id}]")
+
+    def send_key(self, keycode):
+        send_adb_keyevent(self.target_adb, keycode, self.display_id)
+
 
 class DisplayItemWidget(QFrame):
     """Card item untuk masing-masing Layar Sekunder"""
@@ -427,6 +811,15 @@ class DisplayItemWidget(QFrame):
         bot_row.addWidget(self.txt_res, stretch=2)
         layout.addLayout(bot_row)
 
+        # Baris 3: Opsi Tombol Navigasi Layar (Pilih, Home, Kembali)
+        nav_row = QHBoxLayout()
+        self.chk_nav = QCheckBox("🕹️ Aktifkan Tombol Navigasi Layar (Pilih, Home, Kembali)")
+        self.chk_nav.setChecked(data.get("nav_buttons", True))
+        self.chk_nav.toggled.connect(self.parent_gui.save_config)
+        nav_row.addWidget(self.chk_nav)
+        nav_row.addStretch()
+        layout.addLayout(nav_row)
+
     def on_preset_changed(self, idx):
         val = self.combo_preset.itemData(idx)
         if val:
@@ -437,7 +830,8 @@ class DisplayItemWidget(QFrame):
         return {
             "name": self.txt_name.text().strip(),
             "res": self.txt_res.text().strip(),
-            "enabled": self.chk_enabled.isChecked()
+            "enabled": self.chk_enabled.isChecked(),
+            "nav_buttons": self.chk_nav.isChecked()
         }
 
 
@@ -445,6 +839,7 @@ class ScrcpyGUI(QWidget):
     def __init__(self):
         super().__init__()
         self.active_processes = []
+        self.active_overlays = []
         self.config = self.load_config()
         self.display_widgets = []
         self.initUI()
@@ -481,6 +876,7 @@ class ScrcpyGUI(QWidget):
             "mode": "mirror" if self.current_mode == "mirror" else "virtual",
             "mirror_turn_screen_off": self.chk_turn_off_screen.isChecked(),
             "mirror_stay_awake": self.chk_stay_awake.isChecked(),
+            "mirror_nav_buttons": self.chk_mirror_nav.isChecked(),
             "virtual_displays": displays,
             "no_audio": self.chk_no_audio.isChecked(),
             "bitrate": self.combo_bitrate.currentText()
@@ -518,9 +914,23 @@ class ScrcpyGUI(QWidget):
         card_conn_layout.setContentsMargins(16, 16, 16, 16)
         card_conn_layout.setSpacing(12)
 
-        title_conn = QLabel("⚡ Koneksi ADB (Wi-Fi Debugging)")
+        card_conn_header = QHBoxLayout()
+        title_conn = QLabel("⚡ Koneksi ADB (Wi-Fi / USB Debugging)")
         title_conn.setProperty("class", "cardTitle")
-        card_conn_layout.addWidget(title_conn)
+        
+        btn_about = QPushButton("ℹ️ Tentang")
+        btn_about.setObjectName("btnAbout")
+        btn_about.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        btn_about.clicked.connect(self.show_about_dialog)
+
+        card_conn_header.addWidget(title_conn, stretch=1)
+        card_conn_header.addWidget(btn_about)
+        card_conn_layout.addLayout(card_conn_header)
+
+        # Baris Info Mode USB
+        lbl_mode_hint = QLabel("💡 Kosongkan IP & Port jika menggunakan kabel USB Debugging langsung.")
+        lbl_mode_hint.setStyleSheet("color: #64748B; font-size: 11.5px; font-style: italic;")
+        card_conn_layout.addWidget(lbl_mode_hint)
 
         # Baris IP & Port + Tombol Smart Paste & IP Lokal
         ip_row = QHBoxLayout()
@@ -618,10 +1028,12 @@ class ScrcpyGUI(QWidget):
 
         # Sub-opsi Mirror
         self.mirror_panel = QFrame()
-        m_layout = QHBoxLayout(self.mirror_panel)
+        m_layout = QVBoxLayout(self.mirror_panel)
         m_layout.setContentsMargins(4, 4, 4, 4)
-        m_layout.setSpacing(16)
+        m_layout.setSpacing(8)
 
+        m_row1 = QHBoxLayout()
+        m_row1.setSpacing(16)
         self.chk_turn_off_screen = QCheckBox("Matikan Layar Fisik HP (--turn-screen-off)")
         self.chk_turn_off_screen.setChecked(self.config.get("mirror_turn_screen_off", False))
         self.chk_turn_off_screen.toggled.connect(self.save_config)
@@ -630,9 +1042,19 @@ class ScrcpyGUI(QWidget):
         self.chk_stay_awake.setChecked(self.config.get("mirror_stay_awake", True))
         self.chk_stay_awake.toggled.connect(self.save_config)
 
-        m_layout.addWidget(self.chk_turn_off_screen)
-        m_layout.addWidget(self.chk_stay_awake)
-        m_layout.addStretch()
+        m_row1.addWidget(self.chk_turn_off_screen)
+        m_row1.addWidget(self.chk_stay_awake)
+        m_row1.addStretch()
+        m_layout.addLayout(m_row1)
+
+        m_row2 = QHBoxLayout()
+        self.chk_mirror_nav = QCheckBox("🕹️ Aktifkan Tombol Navigasi Layar (Pilih, Home, Kembali)")
+        self.chk_mirror_nav.setChecked(self.config.get("mirror_nav_buttons", True))
+        self.chk_mirror_nav.toggled.connect(self.save_config)
+        m_row2.addWidget(self.chk_mirror_nav)
+        m_row2.addStretch()
+        m_layout.addLayout(m_row2)
+
         card_mode_layout.addWidget(self.mirror_panel)
 
         # Sub-opsi Virtual Multi-Display
@@ -694,6 +1116,24 @@ class ScrcpyGUI(QWidget):
         self.btn_start.clicked.connect(self.run_scrcpy)
         main_layout.addWidget(self.btn_start)
 
+        # Baris Pintasan Bilah Navigasi Layar
+        nav_quick_box = QHBoxLayout()
+        nav_quick_box.setSpacing(8)
+
+        self.btn_manual_nav = QPushButton("🕹️ Buka Bilah Navigasi Manual")
+        self.btn_manual_nav.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.btn_manual_nav.setToolTip("Munculkan bilah navigasi (Pilih, Home, Kembali) secara langsung tanpa perlu restart scrcpy")
+        self.btn_manual_nav.clicked.connect(self.spawn_manual_nav_overlay)
+
+        self.btn_close_all_nav = QPushButton("✕ Tutup Semua Navigasi")
+        self.btn_close_all_nav.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.btn_close_all_nav.setToolTip("Tutup semua bilah tombol navigasi melayang yang aktif")
+        self.btn_close_all_nav.clicked.connect(self.close_all_nav_overlays)
+
+        nav_quick_box.addWidget(self.btn_manual_nav, stretch=2)
+        nav_quick_box.addWidget(self.btn_close_all_nav, stretch=1)
+        main_layout.addLayout(nav_quick_box)
+
         # ================= LOG TERMINAL =================
         log_label = QLabel("Output Log Terminal:")
         log_label.setProperty("class", "fieldLabel")
@@ -749,7 +1189,8 @@ class ScrcpyGUI(QWidget):
         new_data = {
             "name": f"Display {idx}",
             "res": "1920x1080/320",
-            "enabled": True
+            "enabled": True,
+            "nav_buttons": True
         }
         self._create_display_widget(new_data)
         self.save_config()
@@ -835,6 +1276,10 @@ class ScrcpyGUI(QWidget):
             self.log(f"Memuat dari riwayat: {selected}")
             self.save_config()
 
+    def show_about_dialog(self):
+        dlg = AboutDialog(self)
+        dlg.exec()
+
     # ---------------- ADB & SCRCPY EXECUTION ----------------
     def log(self, message):
         self.log_output.append(message)
@@ -845,7 +1290,11 @@ class ScrcpyGUI(QWidget):
         ip = self.ip_input.text().strip()
         port = self.port_input.text().strip()
         if not ip or not port:
-            QMessageBox.warning(self, "Peringatan", "Harap isi IP dan Port terlebih dahulu!")
+            QMessageBox.information(
+                self, 
+                "Informasi Mode", 
+                "IP atau Port kosong.\n\nJika menggunakan USB Debugging, perangkat otomatis terhubung tanpa perlu tombol 'Connect ADB'. Anda bisa langsung menekan '🔍 Cek Devices' atau '🚀 JALANKAN SCRCPY'."
+            )
             return
 
         target = f"{ip}:{port}"
@@ -877,9 +1326,65 @@ class ScrcpyGUI(QWidget):
                 **get_subprocess_kwargs()
             )
             self.log("--- Daftar ADB Devices Aktif ---")
+            lines = res.stdout.strip().splitlines()
             self.log(res.stdout.strip())
+
+            # Berikan panduan ramah USB / Wi-Fi
+            device_lines = [l for l in lines[1:] if l.strip() and not l.startswith("*")]
+            if not device_lines:
+                self.log("⚠️ Tidak ada perangkat Android terdeteksi.")
+                self.log("💡 Pastikan USB Debugging aktif di ponsel dan kabel USB terhubung, atau masukkan IP:Port Wi-Fi.")
+            else:
+                usb_devs = [l for l in device_lines if not re.match(r'^\d{1,3}(?:\.\d{1,3}){3}:\d+', l.split()[0])]
+                if usb_devs:
+                    self.log(f"🔌 Terdeteksi {len(usb_devs)} perangkat mode USB Debugging aktif!")
         except Exception as e:
             self.log(f"Gagal memeriksa perangkat: {e}")
+
+    def get_adb_target(self):
+        ip = self.ip_input.text().strip()
+        port = self.port_input.text().strip()
+        return f"{ip}:{port}" if (ip and port) else None
+
+    def create_nav_overlay(self, title, display_id=None, proc=None):
+        target = self.get_adb_target()
+        overlay = NavOverlayBar(title, target, display_id, on_close=self.on_overlay_closed)
+        self.active_overlays.append(overlay)
+        if proc:
+            if not hasattr(proc, "attached_overlays"):
+                proc.attached_overlays = []
+            proc.attached_overlays.append(overlay)
+
+        # Atur posisi default agar rapi dan tidak bertumpuk di layar
+        screen = QApplication.primaryScreen()
+        if screen:
+            geo = screen.geometry()
+            idx = len(self.active_overlays) - 1
+            x = (geo.width() - 360) // 2
+            y = geo.height() - 110 - (idx * 52)
+            overlay.move(max(20, x), max(40, y))
+
+        overlay.show()
+        return overlay
+
+    def on_overlay_closed(self, overlay):
+        if overlay in self.active_overlays:
+            self.active_overlays.remove(overlay)
+
+    def spawn_manual_nav_overlay(self):
+        """Membuat bilah navigasi secara langsung untuk keperluan pengujian atau penggunaan manual"""
+        title = "Layar Primer" if self.current_mode == "mirror" else "Layar Sekunder"
+        disp_id = None
+        self.create_nav_overlay(title, display_id=disp_id)
+        self.log(f"🕹️ Bilah navigasi manual dibuka ({title}).")
+
+    def close_all_nav_overlays(self):
+        count = len(self.active_overlays)
+        for ov in list(self.active_overlays):
+            ov.close()
+        self.active_overlays.clear()
+        if count > 0:
+            self.log(f"✕ Menutup {count} bilah navigasi.")
 
     def run_scrcpy(self):
         ip = self.ip_input.text().strip()
@@ -890,7 +1395,11 @@ class ScrcpyGUI(QWidget):
         scrcpy_bin = get_binary_path("scrcpy")
         base_cmd = [scrcpy_bin]
         if ip and port:
+            self.log(f"📶 Menjalankan Scrcpy via Wi-Fi ({ip}:{port})...")
             base_cmd.extend(["-s", f"{ip}:{port}"])
+        else:
+            self.log("🔌 Menjalankan Scrcpy via USB Debugging (Device default)...")
+
         if no_audio:
             base_cmd.append("--no-audio")
         if bitrate:
@@ -904,7 +1413,8 @@ class ScrcpyGUI(QWidget):
                 cmd.append("--stay-awake")
 
             cmd.append("--window-title=Scrcpy (Layar Primer)")
-            self.start_process_instance(cmd, "Layar Primer")
+            enable_nav = self.chk_mirror_nav.isChecked()
+            self.start_process_instance(cmd, "Layar Primer", enable_nav=enable_nav, display_id=None)
         else:
             active_displays = [w.get_data() for w in self.display_widgets if w.get_data()["enabled"]]
             if not active_displays:
@@ -916,6 +1426,7 @@ class ScrcpyGUI(QWidget):
                 cmd = list(base_cmd)
                 res = disp.get("res", "").strip()
                 name = disp.get("name", "Display Sekunder")
+                enable_nav = disp.get("nav_buttons", True)
 
                 if res:
                     cmd.append(f"--new-display={res}")
@@ -923,21 +1434,53 @@ class ScrcpyGUI(QWidget):
                     cmd.append("--new-display")
 
                 cmd.append(f"--window-title=Scrcpy - {name}")
-                self.start_process_instance(cmd, name)
+                self.start_process_instance(cmd, name, enable_nav=enable_nav)
 
-    def start_process_instance(self, cmd, label):
+    def start_process_instance(self, cmd, label, enable_nav=False, display_id=None):
         proc = QProcess(self)
         self.active_processes.append(proc)
+        proc.attached_overlays = []
 
-        proc.readyReadStandardOutput.connect(
-            lambda p=proc, l=label: self.log(f"[{l}] {p.readAllStandardOutput().data().decode('utf-8', errors='ignore').strip()}")
-        )
-        proc.readyReadStandardError.connect(
-            lambda p=proc, l=label: self.log(f"[{l}] {p.readAllStandardError().data().decode('utf-8', errors='ignore').strip()}")
-        )
-        proc.finished.connect(
-            lambda exitCode, exitStatus, l=label: self.log(f"[{l}] Proses selesai (code: {exitCode})")
-        )
+        # Buat environment bersih agar QProcess tidak mewarisi LD_LIBRARY_PATH lama dari PyInstaller
+        clean_env = get_clean_env()
+        qenv = QProcessEnvironment()
+        for k, v in clean_env.items():
+            qenv.insert(k, v)
+        proc.setProcessEnvironment(qenv)
+
+        if enable_nav:
+            self.create_nav_overlay(label, display_id=display_id, proc=proc)
+
+        def handle_stdout(p=proc, l=label):
+            raw = p.readAllStandardOutput().data().decode('utf-8', errors='ignore').strip()
+            if raw:
+                self.log(f"[{l}] {raw}")
+                # Deteksi jika scrcpy mencetak display ID untuk display sekunder
+                m = re.search(r'(?:display|id)\s*[:=#]\s*(\d+)', raw, re.IGNORECASE)
+                if m and hasattr(p, "attached_overlays"):
+                    found_id = m.group(1)
+                    for ov in p.attached_overlays:
+                        if ov.display_id is None:
+                            ov.set_display_id(found_id)
+                            self.log(f"💡 [{l}] Menghubungkan navigasi ke Android Display ID: {found_id}")
+
+        def handle_stderr(p=proc, l=label):
+            raw = p.readAllStandardError().data().decode('utf-8', errors='ignore').strip()
+            if raw:
+                self.log(f"[{l}] {raw}")
+
+        def handle_finished(exitCode, exitStatus, p=proc, l=label):
+            self.log(f"[{l}] Proses selesai (code: {exitCode})")
+            if hasattr(p, "attached_overlays"):
+                for ov in list(p.attached_overlays):
+                    ov.close()
+                p.attached_overlays.clear()
+            if p in self.active_processes:
+                self.active_processes.remove(p)
+
+        proc.readyReadStandardOutput.connect(handle_stdout)
+        proc.readyReadStandardError.connect(handle_stderr)
+        proc.finished.connect(handle_finished)
 
         cmd_str = " ".join(cmd)
         self.log(f"\n🚀 Menjalankan: {cmd_str}")
