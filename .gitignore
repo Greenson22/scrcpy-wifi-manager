@@ -1,0 +1,15 @@
+# Python Virtual Environments
+.venv/
+.env/
+env/
+venv/
+ENV/
+
+# Python Cache & Bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Configs & Logs (opsional jika ingin config lokal tidak ter-commit)
+# config.json
+*.log
