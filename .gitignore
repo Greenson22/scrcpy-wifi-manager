@@ -10,6 +10,13 @@ __pycache__/
 *.py[cod]
 *$py.class
 
-# Configs & Logs (opsional jika ingin config lokal tidak ter-commit)
-# config.json
+# PyInstaller Outputs
+build/
+dist/
+*.spec
+
+# Screenshots & Local configs
+screenshot_*.png
+config.json
 *.log
+
